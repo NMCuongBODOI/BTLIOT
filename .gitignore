@@ -1,0 +1,8 @@
+# Bỏ qua thư mục môi trường ảo
+Source code/AI/.venv_mp/
+Source code/AI/venv_ai/
+.venv_mp/
+venv_ai/
+__pycache__/
+*.dll
+*.pyd

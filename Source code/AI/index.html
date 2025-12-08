@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Security Monitor</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #00d9ff;
+        }
+        .dashboard {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .card {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        .status-box {
+            text-align: center;
+            padding: 40px;
+            border-radius: 10px;
+            font-size: 2em;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        .status-RED { background: #e74c3c; }
+        .status-YELLOW { background: #f39c12; }
+        .status-GREEN { background: #27ae60; }
+        .status-NORMAL { background: #34495e; }
+        .message {
+            margin-top: 20px;
+            padding: 15px;
+            background: #0f3460;
+            border-radius: 5px;
+        }
+        .image-preview {
+            width: 100%;
+            max-height: 400px;
+            object-fit: contain;
+            border-radius: 5px;
+            background: #000;
+        }
+        .timestamp {
+            text-align: right;
+            opacity: 0.7;
+            font-size: 0.9em;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🛡️ AI Security Monitoring System</h1>
+        
+        <div class="dashboard">
+            <div class="card">
+                <h2>📊 Trạng thái hiện tại</h2>
+                <div id="statusBox" class="status-box status-NORMAL">
+                    NORMAL
+                </div>
+                <div class="message">
+                    <strong>Tin nhắn:</strong>
+                    <p id="message">Chờ dữ liệu...</p>
+                </div>
+                <div class="timestamp">
+                    Cập nhật: <span id="timestamp">--:--:--</span>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>📸 Ảnh từ AI</h2>
+                <img id="imagePreview" class="image-preview" src="" alt="Chưa có ảnh">
+            </div>
+
+            <div class="card" style="grid-column: 1 / -1;">
+                <h2>📹 Video Stream (Webcam)</h2>
+                <div id="videoStatus" style="padding: 10px; background: #f39c12; border-radius: 5px; margin-bottom: 10px;">
+                    ⏳ Đang tải video stream...
+                </div>
+                <img id="videoStream" 
+                     src="/video/stream" 
+                     style="width: 100%; height: auto; border-radius: 5px; background: #000; display: none;"
+                     alt="Video Stream"
+                     onload="document.getElementById('videoStatus').innerHTML='✅ Video stream đang hoạt động'; document.getElementById('videoStatus').style.background='#27ae60'; this.style.display='block';"
+                     onerror="document.getElementById('videoStatus').innerHTML='❌ Không thể kết nối video stream. Kiểm tra webcam_stream.py đã chạy chưa?'; document.getElementById('videoStatus').style.background='#e74c3c';">
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Test kết nối đến các API
+        console.log('🔍 Đang test kết nối...');
+        
+        fetch('/api/status')
+            .then(res => res.json())
+            .then(data => console.log('✅ API Status OK:', data))
+            .catch(err => console.error('❌ API Status lỗi:', err));
+
+        fetch('/video/stream')
+            .then(res => console.log('✅ Video stream response:', res.status))
+            .catch(err => console.error('❌ Video stream lỗi:', err));
+
+        function updateStatus() {
+            fetch('/api/status')
+                .then(res => res.json())
+                .then(data => {
+                    const statusBox = document.getElementById('statusBox');
+                    const message = document.getElementById('message');
+                    const timestamp = document.getElementById('timestamp');
+                    const imagePreview = document.getElementById('imagePreview');
+
+                    // Cập nhật status
+                    statusBox.className = `status-box status-${data.status}`;
+                    statusBox.textContent = data.status;
+
+                    // Cập nhật message
+                    message.textContent = data.message;
+
+                    // Cập nhật thời gian
+                    const date = new Date(data.timestamp * 1000);
+                    timestamp.textContent = date.toLocaleTimeString('vi-VN');
+
+                    // Cập nhật ảnh nếu có
+                    if (data.image_base64) {
+                        imagePreview.src = `data:image/jpeg;base64,${data.image_base64}`;
+                    }
+                })
+                .catch(err => console.error('Lỗi lấy status:', err));
+        }
+
+        // Cập nhật mỗi giây
+        setInterval(updateStatus, 1000);
+        updateStatus();
+    </script>
+</body>
+</html>
