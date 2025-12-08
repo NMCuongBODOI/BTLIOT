@@ -10,12 +10,12 @@ import mediapipe as mp
 import time
 import requests
 import threading
+from collections import Counter
 
 app = Flask(__name__)
 
 # --- CẤU HÌNH ---
 SERVER_URL = "http://localhost:3000/api/alert"
-WALL_LINE_Y = 0.3
 WAVE_TRIGGER_FRAMES = 30
 SAFE_DURATION = 30
 
@@ -33,7 +33,7 @@ class AIProcessor:
         self.wave_counter = 0
         self.prev_wrist_x = 0
         self.prev_direction = 0
-        self.WAVE_THRESHOLD = 6
+        self.WAVE_THRESHOLD = 3
         self.MIN_MOVE_DIST = 0.02
 
     def send_alert_thread(self, status, message, frame):
@@ -53,22 +53,93 @@ class AIProcessor:
         except Exception as e:
             print(f"[LỖI] Không gửi được: {e}")
 
-    def check_pose_logic(self, landmarks):
-        """Kiểm tra logic Ngã và Trèo"""
+    def detect_wall_region(self, frame):
+        """
+        Phát hiện tường bằng Cạnh (Edge) thay vì Màu
+        Tìm các đường thẳng nằm ngang dài nhất ở nửa dưới màn hình.
+        (Logic từ temp2.py)
+        """
+        try:
+            h, w = frame.shape[:2]
+            
+            # 1. Chỉ xử lý nửa dưới màn hình (để tránh trần nhà, đèn...)
+            roi_y_start = int(h * 0.3) 
+            roi = frame[roi_y_start:h, 0:w]
+            
+            # 2. Xử lý ảnh: Grayscale -> Blur -> Canny
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            
+            # Canny threshold: 50, 150 là ngưỡng phổ biến cho môi trường tự nhiên
+            edges = cv2.Canny(blurred, 30, 100)
+            
+            # 3. Tìm đường thẳng (Hough Transform)
+            # minLineLength: Đường phải dài ít nhất 30% chiều rộng ảnh mới tính là tường
+            lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, 
+                                    minLineLength=w//3, maxLineGap=20)
+            
+            if lines is None:
+                return False, None
+                
+            wall_candidates = []
+            
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                
+                # Tính độ nghiêng (chỉ lấy đường nằm ngang hoặc hơi nghiêng)
+                if x2 - x1 == 0: continue # Bỏ qua đường dọc 90 độ
+                slope = abs((y2 - y1) / (x2 - x1))
+                
+                if slope < 0.1: # Chỉ lấy đường gần như nằm ngang (slope < 10%)
+                    avg_y = (y1 + y2) / 2
+                    length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+                    wall_candidates.append((avg_y, length))
+            
+            if not wall_candidates:
+                return False, None
+                
+            # 4. Logic chọn tường:
+            # Chọn đường dài nhất (hoặc bạn có thể chọn đường cao nhất/thấp nhất tùy nhu cầu)
+            best_wall = max(wall_candidates, key=lambda x: x[1])
+            best_y_in_roi = best_wall[0]
+            
+            # Chuyển đổi tọa độ từ ROI về khung hình gốc
+            real_wall_y = roi_y_start + best_y_in_roi
+            
+            # Normalize (0.0 -> 1.0)
+            return True, real_wall_y / h
+
+        except Exception as e:
+            print(f"Lỗi detect wall: {e}")
+            return False, None
+
+    def check_pose_logic(self, landmarks, frame):
+        """Kiểm tra logic Ngã và Trèo (Logic từ temp2.py)"""
         h_list = [lm.y for lm in landmarks]
         w_list = [lm.x for lm in landmarks]
         
         height = max(h_list) - min(h_list)
         width = max(w_list) - min(w_list)
         
+        # Phát hiện ngã
         if width > height * 1.2:
             return "FALL"
+        
+        # Phát hiện leo tường
+        has_wall, wall_y = self.detect_wall_region(frame)
+        
+        if has_wall and wall_y:
+            l_hip = landmarks[self.mp_holistic.PoseLandmark.LEFT_HIP].y
+            r_hip = landmarks[self.mp_holistic.PoseLandmark.RIGHT_HIP].y
+            l_shoulder = landmarks[self.mp_holistic.PoseLandmark.LEFT_SHOULDER].y
+            r_shoulder = landmarks[self.mp_holistic.PoseLandmark.RIGHT_SHOULDER].y
             
-        l_hip = landmarks[self.mp_holistic.PoseLandmark.LEFT_HIP].y
-        r_hip = landmarks[self.mp_holistic.PoseLandmark.RIGHT_HIP].y
-        if l_hip < WALL_LINE_Y or r_hip < WALL_LINE_Y:
-            return "CLIMB"
+            upper_body_y = min(l_shoulder, r_shoulder, l_hip, r_hip)
             
+            # Nếu thân trên cao hơn tường = đang leo
+            if upper_body_y < wall_y:
+                return "CLIMB"
+        
         return "NORMAL"
 
     def is_waving(self, landmarks):
@@ -119,7 +190,7 @@ class AIProcessor:
 
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
-            pose_status = self.check_pose_logic(landmarks)
+            pose_status = self.check_pose_logic(landmarks, frame)  # Truyền thêm frame
             has_face = results.face_landmarks is not None
             
             if pose_status == "FALL":
