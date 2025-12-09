@@ -1,27 +1,29 @@
+
+
 """
-Flask API nhận ảnh từ Node.js và xử lý bằng AI
-Chạy trên port 5001 (khác với webcam_stream.py port 5000)
+Phiên bản sử dụng Webcam máy tính
+Xử lý trực tiếp video stream từ camera
 """
-from flask import Flask, request, jsonify
 import cv2
 import numpy as np
-import base64
 import mediapipe as mp
 import time
 import requests
 import threading
 from collections import Counter
+import base64
+import math
 
-app = Flask(__name__)
 
 # --- CẤU HÌNH ---
 SERVER_URL = "http://localhost:3000/api/alert"
-WAVE_TRIGGER_FRAMES = 30
 SAFE_DURATION = 30
+CAMERA_ID = 0
 
 class AIProcessor:
     def __init__(self):
         self.mp_holistic = mp.solutions.holistic
+        self.mp_drawing = mp.solutions.drawing_utils
         self.holistic = self.mp_holistic.Holistic(
             min_detection_confidence=0.5, 
             min_tracking_confidence=0.5
@@ -57,7 +59,6 @@ class AIProcessor:
         """
         Phát hiện tường bằng Cạnh (Edge) thay vì Màu
         Tìm các đường thẳng nằm ngang dài nhất ở nửa dưới màn hình.
-        (Logic từ temp2.py)
         """
         try:
             h, w = frame.shape[:2]
@@ -112,36 +113,79 @@ class AIProcessor:
         except Exception as e:
             print(f"Lỗi detect wall: {e}")
             return False, None
+        
 
     def check_pose_logic(self, landmarks, frame):
-        """Kiểm tra logic Ngã và Trèo (Logic từ temp2.py)"""
-        h_list = [lm.y for lm in landmarks]
-        w_list = [lm.x for lm in landmarks]
+        """
+        Kiểm tra logic Ngã và Trèo 
+        Sử dụng góc nghiêng cơ thể thay vì tỷ lệ khung hình.
+        """
+        # Lấy tọa độ các điểm mốc quan trọng (Thân trên)
+        l_shoulder = landmarks[self.mp_holistic.PoseLandmark.LEFT_SHOULDER]
+        r_shoulder = landmarks[self.mp_holistic.PoseLandmark.RIGHT_SHOULDER]
+        l_hip = landmarks[self.mp_holistic.PoseLandmark.LEFT_HIP]
+        r_hip = landmarks[self.mp_holistic.PoseLandmark.RIGHT_HIP]
         
-        height = max(h_list) - min(h_list)
-        width = max(w_list) - min(w_list)
+        # 1. LOGIC PHÁT HIỆN NGÃ (FALL) - Dựa trên góc nghiêng
+        # Tính điểm giữa vai và điểm giữa hông
+        mid_shoulder_x = (l_shoulder.x + r_shoulder.x) / 2
+        mid_shoulder_y = (l_shoulder.y + r_shoulder.y) / 2
         
-        # Phát hiện ngã
-        if width > height * 1.2:
-            return "FALL"
+        mid_hip_x = (l_hip.x + r_hip.x) / 2
+        mid_hip_y = (l_hip.y + r_hip.y) / 2
         
-        # Phát hiện leo tường
+        # Tính vector trục cơ thể (từ vai xuống hông)
+        dx = mid_hip_x - mid_shoulder_x
+        dy = mid_hip_y - mid_shoulder_y # Y tăng dần từ trên xuống dưới
+        
+        # Nếu cam quá mờ, MediaPipe có thể bắt sai khiến dy ~ 0 hoặc âm (đầu dưới chân)
+        # Chỉ xét khi độ tin cậy của các điểm này > 0.5 (visible)
+        confidence_check = (l_shoulder.visibility > 0.5 and r_shoulder.visibility > 0.5 and 
+                            l_hip.visibility > 0.5 and r_hip.visibility > 0.5)
+        
+        if confidence_check:
+            # Tính góc nghiêng so với trục thẳng đứng (độ)
+            # atan2 trả về radian, đổi sang độ. 
+            # 90 độ là đứng thẳng, 0 hoặc 180 là nằm ngang.
+            angle_rad = math.atan2(dy, dx) 
+            angle_deg = abs(math.degrees(angle_rad))
+            
+            # Chuẩn hóa góc: 90 là đứng, về gần 0 hoặc 180 là nằm
+            # Nếu góc lệch khỏi phương thẳng đứng quá nhiều -> NGÃ
+            # Bình thường đứng: góc khoảng 80-100 độ (so với trục hoành) hoặc -80 đến -100
+            # Nằm: góc < 45 hoặc > 135
+            
+            is_horizontal = angle_deg < 45 or angle_deg > 135
+            
+            # Bổ sung: Kiểm tra độ bẹt của thân người (Torso)
+            # Khi nằm, khoảng cách dọc (dy) sẽ rất nhỏ so với khoảng cách ngang vai
+            shoulder_width = abs(l_shoulder.x - r_shoulder.x)
+            torso_compressed = abs(dy) < shoulder_width * 0.8
+            
+            if is_horizontal or torso_compressed:
+                return "FALL"
+        else:
+            # Fallback cho trường hợp cam quá mờ không thấy hông:
+            # Dùng bounding box nhưng chỉ so sánh chiều rộng vai và chiều cao đầu-ngực
+            # (Logic cũ nhưng gắt hơn)
+            h_list = [lm.y for lm in landmarks]
+            w_list = [lm.x for lm in landmarks]
+            height = max(h_list) - min(h_list)
+            width = max(w_list) - min(w_list)
+            if width > height * 1.5: # Tăng ngưỡng lên 1.5 để tránh báo ảo
+                return "FALL"
+
+        # 2. LOGIC PHÁT HIỆN LEO TƯỜNG (CLIMB) - Giữ nguyên logic cũ
         has_wall, wall_y = self.detect_wall_region(frame)
         
         if has_wall and wall_y:
-            l_hip = landmarks[self.mp_holistic.PoseLandmark.LEFT_HIP].y
-            r_hip = landmarks[self.mp_holistic.PoseLandmark.RIGHT_HIP].y
-            l_shoulder = landmarks[self.mp_holistic.PoseLandmark.LEFT_SHOULDER].y
-            r_shoulder = landmarks[self.mp_holistic.PoseLandmark.RIGHT_SHOULDER].y
-            
-            upper_body_y = min(l_shoulder, r_shoulder, l_hip, r_hip)
-            
-            # Nếu thân trên cao hơn tường = đang leo
+            upper_body_y = min(l_shoulder.y, r_shoulder.y, l_hip.y, r_hip.y)
+            # Nếu thân trên cao hơn tường
             if upper_body_y < wall_y:
                 return "CLIMB"
         
         return "NORMAL"
-
+    
     def is_waving(self, landmarks):
         """Kiểm tra vẫy tay"""
         l_wrist = landmarks[self.mp_holistic.PoseLandmark.LEFT_WRIST]
@@ -169,7 +213,6 @@ class AIProcessor:
             current_dir = 1 if dx > 0 else -1
             if self.prev_direction != 0 and current_dir != self.prev_direction:
                 self.wave_counter += 1
-                print(f"👋 Detect Wave: {self.wave_counter}/{self.WAVE_THRESHOLD}")
             self.prev_direction = current_dir
             self.prev_wrist_x = current_x
 
@@ -179,47 +222,137 @@ class AIProcessor:
 
         return False
 
+    def check_face_status(self, face_landmarks, frame):
+            """
+            Kiểm tra trạng thái khuôn mặt:
+            1. Bỏ qua góc nghiêng (Nghiêng cũng được, miễn là có mặt).
+            2. Chỉ tập trung bắt KHẨU TRANG (Độ mịn vùng miệng).
+            Return: "OK" | "MASK"
+            """
+            # Nếu MediaPipe đã trả về face_landmarks thì tức là KHÔNG quay lưng.
+            # (Vì quay lưng MediaPipe sẽ không bắt được điểm nào -> rơi vào case NO_FACE ở ngoài)
+            
+            h, w = frame.shape[:2]
+            lm = face_landmarks.landmark
+
+            # --- KIỂM TRA KHẨU TRANG (Heuristic) ---
+            # So sánh độ "nhiễu" (variance) vùng miệng
+            # Vùng miệng thật có môi, răng -> Độ nhiễu cao
+            # Khẩu trang vải/y tế -> Phẳng, độ nhiễu thấp
+            
+            try:
+                # Lấy vùng miệng (Landmark 13: Môi trên, 14: Môi dưới)
+                mouth_x = int(lm[13].x * w)
+                mouth_y = int(lm[13].y * h)
+                
+                # Crop vùng miệng (20x20 pixel)
+                crop_size = 20
+                y1 = max(0, mouth_y - crop_size)
+                y2 = min(h, mouth_y + crop_size)
+                x1 = max(0, mouth_x - crop_size)
+                x2 = min(w, mouth_x + crop_size)
+                
+                mouth_roi = frame[y1:y2, x1:x2]
+                
+                if mouth_roi.size > 0:
+                    # Chuyển ảnh xám -> Tính độ bén (Laplacian)
+                    gray_roi = cv2.cvtColor(mouth_roi, cv2.COLOR_BGR2GRAY)
+                    laplacian_var = cv2.Laplacian(gray_roi, cv2.CV_64F).var()
+                    
+                    # NGƯỠNG (Threshold):
+                    # < 50: Quá mịn -> Khả năng cao là khẩu trang hoặc che mặt kín
+                    # > 50: Có chi tiết (môi, răng) -> Mặt thật
+                    if laplacian_var < 50: 
+                        return "MASK"
+                        
+            except Exception:
+                pass 
+                
+            return "OK"
+
     def process_frame(self, frame):
-        """Xử lý 1 frame từ ESP32-CAM"""
+        """Xử lý 1 frame (Đã update logic check mặt)"""
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.holistic.process(image)
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         
         status = "YELLOW"
         message = "Dang quet khu vuc..."
+        status_color = (0, 255, 255)
+
+        h, w = image.shape[:2]
+        
+        # Phát hiện tường (không log)
+        has_wall, wall_y = self.detect_wall_region(frame)
+        
+        # VẼ TƯỜNG
+        if has_wall and wall_y:
+            wall_pixel_y = int(wall_y * h)
+            cv2.line(image, (0, wall_pixel_y), (w, wall_pixel_y), (0, 255, 0), 3)
+            cv2.putText(image, f"WALL", (10, wall_pixel_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         if results.pose_landmarks:
-            landmarks = results.pose_landmarks.landmark
-            pose_status = self.check_pose_logic(landmarks, frame)  # Truyền thêm frame
-            has_face = results.face_landmarks is not None
+            # Vẽ skeleton
+            self.mp_drawing.draw_landmarks(
+                image, results.pose_landmarks, self.mp_holistic.POSE_CONNECTIONS)
             
+            landmarks = results.pose_landmarks.landmark
+            pose_status = self.check_pose_logic(landmarks, frame)
+            
+            face_status = "UNKNOWN"
+            if results.face_landmarks:
+                # Có landmark -> Mặt đang nhìn (dù nghiêng hay thẳng)
+                face_status = self.check_face_status(results.face_landmarks, frame)
+            else:
+                # Không có landmark -> Quay lưng hoặc Không có mặt
+                face_status = "NO_FACE"
+
+            # --- TỔNG HỢP CẢNH BÁO ---
             if pose_status == "FALL":
                 status = "RED"
                 message = "NGUY HIEM: Phat hien nguoi NGA!"
+                status_color = (0, 0, 255)
             elif pose_status == "CLIMB":
                 status = "RED"
                 message = "NGUY HIEM: Phat hien LEO TUONG!"
-            elif not has_face:
+                status_color = (0, 0, 255)
+            
+            # Logic check mặt:
+            elif face_status != "OK":
                 status = "RED"
-                message = "CANH BAO: Nguoi giau mat / Quay lung"
+                status_color = (0, 0, 255)
+                
+                if face_status == "NO_FACE":
+                    # Đây là trường hợp: Quay đầu về cam (mất landmark) hoặc che kín mít
+                    message = "CANH BAO: Khong thay mat / Quay lung"
+                elif face_status == "MASK":
+                    # Đây là trường hợp: Có mặt nhưng vùng mồm quá phẳng
+                    message = "CANH BAO: Phat hien KHAU TRANG!"
+            
             else:
+                # Mặt OK (có chi tiết miệng) + Dáng OK -> Check Safe Mode
                 if time.time() < self.safe_mode_until:
                     status = "GREEN"
                     remaining_time = int(self.safe_mode_until - time.time())
                     message = f"XAC NHAN: An toan ({remaining_time}s)"
+                    status_color = (0, 255, 0)
                 else:
                     if self.is_waving(landmarks):
                         self.safe_mode_until = time.time() + SAFE_DURATION
                         message = "DA KICH HOAT CHE DO AN TOAN!"
+                        status_color = (0, 255, 0)
                         print(message)
                     else:
                         status = "YELLOW"
                         message = "Phat hien nguoi - Chua xac minh"
+                        status_color = (0, 255, 255)
         else:
             status = "NORMAL"
             message = "Khong co nguoi"
+            status_color = (128, 128, 128)
 
-        # Gửi cảnh báo nếu trạng thái thay đổi
+        # Gửi cảnh báo
         if status != self.current_status:
             if time.time() - self.last_sent_time > self.send_cooldown:
                 t = threading.Thread(target=self.send_alert_thread, args=(status, message, image))
@@ -227,41 +360,68 @@ class AIProcessor:
                 self.last_sent_time = time.time()
             self.current_status = status
 
-        return {"status": status, "message": message}
+        # Vẽ status
+        cv2.rectangle(image, (10, 10), (630, 80), (0, 0, 0), -1)
+        cv2.putText(image, f"Status: {status}", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        cv2.putText(image, message, (20, 65), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-# Khởi tạo AI processor
-processor = AIProcessor()
+        return image
 
-@app.route('/process_frame', methods=['POST'])
-def process_frame():
-    """Nhận ảnh base64 từ Node.js và xử lý"""
+def main():
+    print("\n🤖 AI Surveillance System - Webcam Version")
+    print("📹 Khởi động camera...")
+    
+    cap = cv2.VideoCapture(CAMERA_ID)
+    
+    if not cap.isOpened():
+        print("❌ Không thể mở camera!")
+        return
+    
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    processor = AIProcessor()
+    print("✅ Hệ thống sẵn sàng!")
+    print("📋 Hướng dẫn:")
+    print("   - Vẫy tay để kích hoạt chế độ an toàn")
+    print("   - Nhấn 'q' để thoát")
+    print("-" * 50)
+    
+    fps_time = time.time()
+    fps_counter = 0
+    
     try:
-        data = request.json
-        image_base64 = data.get('image')
-        
-        # Decode base64 → numpy array
-        img_bytes = base64.b64decode(image_base64)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is None:
-            return jsonify({"error": "Invalid image"}), 400
-        
-        # Xử lý AI
-        result = processor.process_frame(frame)
-        
-        return jsonify(result), 200
-        
-    except Exception as e:
-        print(f"[ERROR] {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "ok", "service": "AI Processor"}), 200
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("❌ Không đọc được frame!")
+                break
+            
+            processed_frame = processor.process_frame(frame)
+            
+            # Tính FPS
+            fps_counter += 1
+            if time.time() - fps_time > 1.0:
+                fps = fps_counter / (time.time() - fps_time)
+                fps_counter = 0
+                fps_time = time.time()
+                cv2.putText(processed_frame, f"FPS: {fps:.1f}", (540, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            cv2.imshow('AI Surveillance - Webcam', processed_frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("\n👋 Đang thoát...")
+                break
+                
+    except KeyboardInterrupt:
+        print("\n⚠️ Đã dừng bởi người dùng")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("✅ Đã đóng camera và cửa sổ")
 
 if __name__ == '__main__':
-    print("\n🤖 AI Processor Service")
-    print("📡 Listening on http://localhost:5001")
-    print("📥 Waiting for frames from Node.js...")
-    app.run(host='0.0.0.0', port=5001, debug=False)
+    main()
